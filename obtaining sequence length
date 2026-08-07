@@ -1,0 +1,44 @@
+import numpy as np
+
+# Your exact FASTA file path
+fasta_file = "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus.fasta"
+
+lengths = []
+current_length = 0
+
+with open(fasta_file, "r") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith(">"):
+            # If we already processed a sequence, save its length
+            if current_length > 0:
+                lengths.append(current_length)
+                current_length = 0
+        else:
+            # Add up the characters of the sequence line (ignoring spaces)
+            current_length += len(line.replace(" ", ""))
+
+    # Don't forget to append the final sequence length in the file
+    if current_length > 0:
+        lengths.append(current_length)
+
+# Calculate statistics using numpy
+if lengths:
+    mean_length = np.mean(lengths)
+    std_length = np.std(lengths)
+    total_sequences = len(lengths)
+    min_length = min(lengths)
+    max_length = max(lengths)
+
+    # Output Summary Results
+    print("=" * 50)
+    print(f"SEQUENCE STATS FOR: all_fasta_consensus.fasta")
+    print("=" * 50)
+    print(f"Total Sequences Counted: {total_sequences}")
+    print(f"Mean Length:             {mean_length:.2f} bp")
+    print(f"Standard Deviation:      {std_length:.2f} bp")
+    print(f"Minimum Length:          {min_length} bp")
+    print(f"Maximum Length:          {max_length} bp")
+    print("=" * 50)
+else:
+    print("No sequences found. Please check your FASTA file path.")

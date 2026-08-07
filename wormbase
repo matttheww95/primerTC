@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""
+Genomic FASTA → pybarrnap GFF3 → rRNA Cluster Parser
+Uses pybarrnap Python package (pip install pybarrnap)
+"""
+import pybarrnap
+import gzip
+import csv
+import os
+import re
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+# Directories
+FASTA_DIR = "/Users/matthew/wormbase_genomic/"
+GFF_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "barrnap_gff3")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+
+
+@dataclass
+class rRNALocus:
+    """Represents a single rRNA feature."""
+    seqid: str
+    source: str
+    type: str
+    start: int
+    end: int
+    score: float
+    strand: str
+    phase: str
+    attributes: Dict[str, str]
+    e_value: Optional[float] = None
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
+
+    @property
+    def gene_id(self) -> str:
+        return self.attributes.get('Parent',
+                                   self.attributes.get('gene_id',
+                                                       self.attributes.get('ID', 'unknown')))
+
+    @property
+    def name(self) -> str:
+        return self.attributes.get('Name', 'unknown')
+
+    def __repr__(self):
+        return f"{self.type}({self.start}-{self.end}, strand={self.strand}, e={self.e_value})"
+
+
+def run_pybarrnap(fasta_file: str, output_gff: str) -> bool:
+    """
+    Run pybarrnap on a genomic FASTA file to predict rRNA regions.
+    Returns True if successful.
+    """
+    print(f"  Running pybarrnap on {os.path.basename(fasta_file)}...")
+
+    try:
+        from pybarrnap import Barrnap
+    except ImportError:
+        print("  ERROR: pybarrnap not installed. Install it first:")
+        print("    pip install pybarrnap")
+        print("    OR: conda install -c bioconda -c conda-forge pybarrnap")
+        return False
+
+    # Check input file
+    if not os.path.exists(fasta_file):
+        print(f"  ✗ Input file not found: {fasta_file}")
+        return False
+
+    file_size = os.path.getsize(fasta_file)
+    print(f"  Input file size: {file_size} bytes")
+
+    if file_size == 0:
+        print(f"  ✗ Input file is empty!")
+        return False
+
+    try:
+        # Run pybarrnap with eukaryote settings
+        # Note: pybarrnap takes fasta_file as FIRST argument to Barrnap()
+        print(f"  Initializing Barrnap (kingdom=euk, threads=4)...")
+        barrnap = Barrnap(
+            fasta=fasta_file,  # FASTA file path goes HERE
+            evalue=1e-02,  # E-value cutoff
+            lencutoff=0.8,  # Length cutoff
+            reject=0.25,  # Reject threshold
+            threads=4,  # Parallel threads
+            kingdom="euk",  # Eukaryote models
+            accurate=True,  # Use pyhmmer (faster), set True for cmscan (more accurate)
+            quiet=False  # Show progress
+        )
+
+        # Run prediction
+        print(f"  Running prediction (this may take several minutes for large genomes)...")
+        result = barrnap.run()
+
+        # Check result
+        if result is None:
+            print(f"  ✗ pybarrnap returned None")
+            return False
+
+        # Write GFF3 output using built-in method
+        print(f"  Writing GFF3 to {output_gff}...")
+        result.write_gff(output_gff)
+
+        # Verify file was written
+        if os.path.exists(output_gff):
+            out_size = os.path.getsize(output_gff)
+            print(f"  ✓ GFF3 saved: {output_gff} ({out_size} bytes)")
+
+            # Count features in output
+            with open(output_gff, 'r') as f:
+                feature_count = len([l for l in f if not l.startswith('#') and l.strip()])
+            print(f"  ✓ pybarrnap predicted {feature_count} rRNA features")
+
+            return True
+        else:
+            print(f"  ✗ File was not created!")
+            return False
+
+    except Exception as e:
+        print(f"  ✗ ERROR running pybarrnap: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def parse_gff(gff_file: str) -> List[rRNALocus]:
+    """Parse GFF3 file and return list of rRNA loci."""
+    rna_types = {'rRNA', '18S_rRNA', '28S_rRNA', '5_8S_rRNA', '5S_rRNA'}
+
+    opener = gzip.open if gff_file.endswith('.gz') else open
+    loci = []
+
+    with opener(gff_file, 'rt') as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+
+            parts = line.strip().split('\t')
+            if len(parts) != 9:
+                continue
+
+            seqid, source, feature_type, start, end, score, strand, phase, attributes = parts
+
+            # BROADER SEARCH for rRNA features
+            is_rrna = False
+            if feature_type in rna_types:
+                is_rrna = True
+            if any(x in feature_type.lower() for x in ['18s', '28s', '5.8s', '5_8s', '5s', 'rrna', 'ribosomal']):
+                is_rrna = True
+
+            attr_lower = attributes.lower()
+            if any(x in attr_lower for x in ['18s', '28s', '5.8s', '5_8s', 'rrna', 'ribosomal', '5s']):
+                is_rrna = True
+
+            if not is_rrna:
+                continue
+
+            # Parse attributes
+            attr_dict = {}
+            for attr in attributes.split(';'):
+                if '=' in attr:
+                    key, value = attr.split('=', 1)
+                    attr_dict[key] = value
+
+            # Extract e-value
+            e_value = None
+            try:
+                score_val = float(score)
+                if score_val > 0:
+                    e_value = score_val
+            except (ValueError, TypeError):
+                pass
+
+            for key in ['evalue', 'e_value', 'E_value']:
+                if key in attr_dict:
+                    try:
+                        e_value = float(attr_dict[key])
+                        break
+                    except ValueError:
+                        pass
+
+            locus = rRNALocus(
+                seqid=seqid,
+                source=source,
+                type=feature_type,
+                start=int(start),
+                end=int(end),
+                score=float(score) if score not in ('.', '0') else 0.0,
+                strand=strand,
+                phase=phase,
+                attributes=attr_dict,
+                e_value=e_value
+            )
+            loci.append(locus)
+
+    return loci
+
+
+def classify_rrna_type(locus: rRNALocus) -> str:
+    """Classify rRNA type from feature type or attributes."""
+    ftype = locus.type.lower()
+    name = locus.name.lower()
+    attrs = str(locus.attributes).lower()
+
+    if any(x in ftype for x in ['18s', '18_s', 'small', 'ssu']):
+        return '18S'
+    if any(x in ftype for x in ['28s', '28_s', 'large', 'lsu']):
+        return '28S'
+    if any(x in ftype for x in ['5.8s', '5_8s', '5.8_s']):
+        return '5.8S'
+    if any(x in ftype for x in ['5s', '5_s']) and '5.8' not in ftype:
+        return '5S'
+
+    if '18s' in name or '18s' in attrs:
+        return '18S'
+    if '28s' in name or '28s' in attrs:
+        return '28S'
+    if '5.8s' in name or '5.8s' in attrs or '5_8s' in attrs:
+        return '5.8S'
+    if '5s' in name and '5.8' not in name:
+        return '5S'
+
+    return 'unknown'
+
+
+def find_rrna_clusters(loci: List[rRNALocus],
+                       max_evalue: float = 1e-10,
+                       max_its1_length: int = 2000,
+                       max_its2_length: int = 2000,
+                       min_its1_length: int = 50,
+                       min_its2_length: int = 50) -> List[Dict]:
+    """Find rRNA clusters with 18S-5.8S-28S in correct order."""
+    by_location = defaultdict(list)
+    for locus in loci:
+        key = (locus.seqid, locus.strand)
+        by_location[key].append(locus)
+
+    clusters = []
+
+    for (seqid, strand), chrom_loci in by_location.items():
+        chrom_loci.sort(key=lambda x: x.start)
+
+        classified = []
+        for locus in chrom_loci:
+            rrna_type = classify_rrna_type(locus)
+            if rrna_type != 'unknown':
+                classified.append((locus, rrna_type))
+
+        for i in range(len(classified) - 2):
+            locus_18s, type_18s = classified[i]
+            locus_58s, type_58s = classified[i + 1]
+            locus_28s, type_28s = classified[i + 2]
+
+            if not (type_18s == '18S' and type_58s == '5.8S' and type_28s == '28S'):
+                continue
+
+            e_values = [locus_18s.e_value, locus_58s.e_value, locus_28s.e_value]
+            if any(ev is None for ev in e_values):
+                continue
+            if any(ev > max_evalue for ev in e_values):
+                continue
+
+            its1_start = locus_18s.end + 1
+            its1_end = locus_58s.start - 1
+            its1_length = its1_end - its1_start + 1 if its1_end >= its1_start else 0
+
+            its2_start = locus_58s.end + 1
+            its2_end = locus_28s.start - 1
+            its2_length = its2_end - its2_start + 1 if its2_end >= its2_start else 0
+
+            if not (min_its1_length <= its1_length <= max_its1_length):
+                continue
+            if not (min_its2_length <= its2_length <= max_its2_length):
+                continue
+
+            if not (locus_18s.strand == locus_58s.strand == locus_28s.strand):
+                continue
+
+            cluster = {
+                'seqid': seqid,
+                'strand': strand,
+                'start': locus_18s.start,
+                'end': locus_28s.end,
+                '18S': locus_18s,
+                '5.8S': locus_58s,
+                '28S': locus_28s,
+                'ITS1_length': its1_length,
+                'ITS2_length': its2_length,
+                'total_length': locus_28s.end - locus_18s.start + 1,
+                'max_evalue': max(e_values),
+                'mean_evalue': sum(e_values) / len(e_values)
+            }
+            clusters.append(cluster)
+
+    return clusters
+
+
+def write_outputs(clusters: List[Dict], species_name: str, output_dir: str):
+    """Write cluster results to TSV and TXT files."""
+    os.makedirs(output_dir, exist_ok=True)
+    base_name = os.path.join(output_dir, species_name)
+
+    # TSV report
+    tsv_file = f"{base_name}_clusters.tsv"
+    with open(tsv_file, 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerow([
+            'seqid', 'strand', 'cluster_start', 'cluster_end', 'total_length',
+            '18S_start', '18S_end', '18S_evalue',
+            'ITS1_length',
+            '5.8S_start', '5.8S_end', '5.8S_evalue',
+            'ITS2_length',
+            '28S_start', '28S_end', '28S_evalue',
+            'mean_evalue', 'max_evalue'
+        ])
+
+        for cluster in clusters:
+            writer.writerow([
+                cluster['seqid'],
+                cluster['strand'],
+                cluster['start'],
+                cluster['end'],
+                cluster['total_length'],
+                cluster['18S'].start,
+                cluster['18S'].end,
+                cluster['18S'].e_value,
+                cluster['ITS1_length'],
+                cluster['5.8S'].start,
+                cluster['5.8S'].end,
+                cluster['5.8S'].e_value,
+                cluster['ITS2_length'],
+                cluster['28S'].start,
+                cluster['28S'].end,
+                cluster['28S'].e_value,
+                cluster['mean_evalue'],
+                cluster['max_evalue']
+            ])
+
+    # FASTA-like coordinates
+    txt_file = f"{base_name}_clusters.txt"
+    with open(txt_file, 'w') as f:
+        for i, cluster in enumerate(clusters, 1):
+            f.write(f">cluster_{i} {cluster['seqid']}:{cluster['start']}-{cluster['end']} "
+                    f"strand={cluster['strand']} "
+                    f"ITS1={cluster['ITS1_length']}bp ITS2={cluster['ITS2_length']}bp "
+                    f"evalue={cluster['mean_evalue']:.2e}\n")
+            f.write(f"18S\t{cluster['18S'].start}\t{cluster['18S'].end}\n")
+            f.write(f"ITS1\t{cluster['18S'].end + 1}\t{cluster['5.8S'].start - 1}\n")
+            f.write(f"5.8S\t{cluster['5.8S'].start}\t{cluster['5.8S'].end}\n")
+            f.write(f"ITS2\t{cluster['5.8S'].end + 1}\t{cluster['28S'].start - 1}\n")
+            f.write(f"28S\t{cluster['28S'].start}\t{cluster['28S'].end}\n\n")
+
+    print(f"  ✓ Results: {tsv_file} ({len(clusters)} clusters)")
+
+
+def process_single_species(fasta_file: str, gff_dir: str, results_dir: str):
+    """Process one genomic FASTA: pybarrnap → GFF3 → parse → clusters."""
+    species_name = os.path.basename(fasta_file).replace('.genomic.fa.gz', '').replace('.fa.gz', '').replace('.fasta.gz',
+                                                                                                            '').replace(
+        '.fna.gz', '').replace('.fa', '').replace('.fasta', '').replace('.fna', '')
+
+    # Step 1: Run pybarrnap if GFF doesn't exist
+    gff_file = os.path.join(gff_dir, f"{species_name}_barrnap.gff3")
+
+    if not os.path.exists(gff_file) or os.path.getsize(gff_file) == 0:
+        print(f"\n{'=' * 60}")
+        print(f"Step 1: pybarrnap annotation for {species_name}")
+        print(f"{'=' * 60}")
+        success = run_pybarrnap(fasta_file, gff_file)
+        if not success:
+            print(f"  ⚠ Skipping {species_name} (pybarrnap failed)")
+            return [], 0
+    else:
+        print(f"\n  Using existing GFF: {gff_file} ({os.path.getsize(gff_file)} bytes)")
+
+    # Step 2: Parse GFF3
+    print(f"\n  Step 2: Parsing GFF3...")
+    loci = parse_gff(gff_file)
+    print(f"  Found {len(loci)} rRNA-related features")
+
+    type_counts = defaultdict(int)
+    for locus in loci:
+        rtype = classify_rrna_type(locus)
+        type_counts[rtype] += 1
+    print(f"  Types: {dict(type_counts)}")
+
+    # Step 3: Find clusters
+    print(f"\n  Step 3: Finding 18S-5.8S-28S clusters...")
+    clusters = find_rrna_clusters(loci)
+    print(f"  Found {len(clusters)} valid clusters")
+
+    # Step 4: Write outputs
+    if clusters:
+        write_outputs(clusters, species_name, results_dir)
+    else:
+        print(f"  ⚠ No clusters found for {species_name}")
+
+    return clusters, len(loci)
+
+
+def main():
+    print("=" * 60)
+    print("Genomic FASTA → pybarrnap GFF3 → rRNA Cluster Finder")
+    print("=" * 60)
+    print(f"FASTA source: {FASTA_DIR}")
+    print(f"pybarrnap GFF3 output: {GFF_OUTPUT_DIR}")
+    print(f"Results: {RESULTS_DIR}")
+    print("=" * 60)
+
+    # Check directories
+    if not os.path.exists(FASTA_DIR):
+        print(f"ERROR: FASTA directory not found: {FASTA_DIR}")
+        print("Download genomic FASTA files first.")
+        return
+
+    os.makedirs(GFF_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # Find all FASTA files
+    fasta_files = []
+    for filename in os.listdir(FASTA_DIR):
+        if any(filename.endswith(ext) for ext in ['.fa.gz', '.fasta.gz', '.fna.gz', '.fa', '.fasta', '.fna']):
+            fasta_files.append(os.path.join(FASTA_DIR, filename))
+
+    if not fasta_files:
+        print(f"ERROR: No FASTA files found in {FASTA_DIR}")
+        return
+
+    print(f"\nFound {len(fasta_files)} FASTA file(s)")
+    for f in sorted(fasta_files):
+        print(f"  - {os.path.basename(f)}")
+
+    # temporrary for testig - just run on first two file!
+    fasta_files = fasta_files[21:22]
+    # Process all filesl
+    all_results = {}
+    for fasta_file in sorted(fasta_files):
+        clusters, total_loci = process_single_species(fasta_file, GFF_OUTPUT_DIR, RESULTS_DIR)
+        species_name = os.path.basename(fasta_file).replace('.genomic.fa.gz', '').replace('.fa.gz', '').replace(
+            '.fasta.gz', '').replace('.fna.gz', '').replace('.fa', '').replace('.fasta', '').replace('.fna', '')
+        all_results[species_name] = {
+            'clusters': clusters,
+            'total_loci': total_loci
+        }
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print("SUMMARY")
+    print(f"{'=' * 60}")
+    for species, data in sorted(all_results.items()):
+        status = "✓" if data['clusters'] else "✗"
+        print(f"{status} {species}: {data['total_loci']} features, {len(data['clusters'])} clusters")
+
+    print(f"\n{'=' * 60}")
+    print(f"ALL OUTPUTS:")
+    print(f"  pybarrnap GFF3: {GFF_OUTPUT_DIR}")
+    print(f"  Cluster results: {RESULTS_DIR}")
+    print(f"{'=' * 60}")
+
+    # List result files
+    if os.path.exists(RESULTS_DIR):
+        result_files = [f for f in os.listdir(RESULTS_DIR) if f.endswith(('.tsv', '.txt'))]
+        print(f"\nResult files ({len(result_files)} total):")
+        for f in sorted(result_files):
+            fpath = os.path.join(RESULTS_DIR, f)
+            fsize = os.path.getsize(fpath)
+            print(f"  {f} ({fsize} bytes)")
+
+
+if __name__ == "__main__":
+    main()

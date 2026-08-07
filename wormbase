@@ -13,11 +13,23 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Dict, Optional
 
-# Directories
-FASTA_DIR = "/Users/matthew/wormbase_genomic/"
-GFF_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "barrnap_gff3")
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+#JAC 3/6 - changed name to make it more memorable..
 
+#JAC 3/6 - rewritten to make these the defaults, but settable on command-line
+#added overwrite_GFF flag to force re-creation of PyBarrnap GFF when we need to (e.g. change of pybarrnap parameters)
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("--fasta_dir",  help="directory to read genome fasta files from",default="/Users/matthew/wormbase_genomic/")
+parser.add_argument("--gff_output_dir", help="directory for GFF outputs",default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "barrnap_gff3"))
+parser.add_argument("--results_dir", help="directory for result outputs",default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"))
+parser.add_argument("--overwrite_GFF", help="re-run pybarrnap for existing gff", action="store_true")
+parser.add_argument("-v","--verbose",action="store_true")
+# Directories
+args = parser.parse_args()
+
+FASTA_DIR = args.fasta_dir
+GFF_OUTPUT_DIR = args.gff_output_dir
+RESULTS_DIR = args.results_dir
 
 @dataclass
 class rRNALocus:
@@ -84,12 +96,12 @@ def run_pybarrnap(fasta_file: str, output_gff: str) -> bool:
         print(f"  Initializing Barrnap (kingdom=euk, threads=4)...")
         barrnap = Barrnap(
             fasta=fasta_file,  # FASTA file path goes HERE
-            evalue=1e-02,  # E-value cutoff
+            evalue=1e-03,  # E-value cutoff
             lencutoff=0.8,  # Length cutoff
             reject=0.25,  # Reject threshold
             threads=4,  # Parallel threads
             kingdom="euk",  # Eukaryote models
-            accurate=True,  # Use pyhmmer (faster), set True for cmscan (more accurate)
+            accurate=False,  # Use pyhmmer (faster), set True for cmscan (more accurate)
             quiet=False  # Show progress
         )
 
@@ -171,7 +183,8 @@ def parse_gff(gff_file: str) -> List[rRNALocus]:
             e_value = None
             try:
                 score_val = float(score)
-                if score_val > 0:
+#JAC 3/6 this is a bug - 0 is a valid score!
+                if score_val >= 0:
                     e_value = score_val
             except (ValueError, TypeError):
                 pass
@@ -228,8 +241,9 @@ def classify_rrna_type(locus: rRNALocus) -> str:
     return 'unknown'
 
 
+#JAC 3/6 - just changed max_evalue from 1e-10!
 def find_rrna_clusters(loci: List[rRNALocus],
-                       max_evalue: float = 1e-10,
+                       max_evalue: float = 1e-3,
                        max_its1_length: int = 2000,
                        max_its2_length: int = 2000,
                        min_its1_length: int = 50,
@@ -252,46 +266,94 @@ def find_rrna_clusters(loci: List[rRNALocus],
                 classified.append((locus, rrna_type))
 
         for i in range(len(classified) - 2):
-            locus_18s, type_18s = classified[i]
-            locus_58s, type_58s = classified[i + 1]
-            locus_28s, type_28s = classified[i + 2]
 
-            if not (type_18s == '18S' and type_58s == '5.8S' and type_28s == '28S'):
+      
+            #this will be confusing at some point.. but if strand =='-' then
+            #the names are wrong..
+
+            first_locus, first_type = classified[i]
+            second_locus, second_type = classified[i+1]
+            third_locus, third_type = classified[i+2]
+            
+            #JAC debugging
+            if args.verbose:
+                print(first_type,second_type,third_type)
+
+            #are all three loci on the same strand?
+            if not (first_locus.strand == second_locus.strand == third_locus.strand):
                 continue
+            
+            #JAC 3/6 need to check for OPPOSITE order if reverse strand
+            if (strand == '-'):
+                if not (first_type == '28S' and second_type == '5.8S' and third_type == '18S'):
+                    continue   
+            else:
+                if not (first_type == '18S' and second_type == '5.8S' and third_type == '28S'):
+                    continue
 
-            e_values = [locus_18s.e_value, locus_58s.e_value, locus_28s.e_value]
+            #got a cluster
+            #JAC debugging
+            if args.verbose:
+                print("got a cluster order")
+
+            e_values = [first_locus.e_value, second_locus.e_value, third_locus.e_value]
             if any(ev is None for ev in e_values):
+                if args.verbose:
+                    print("null e_value found")
                 continue
             if any(ev > max_evalue for ev in e_values):
+                if args.verbose:
+                    print("high e-value found")
                 continue
 
-            its1_start = locus_18s.end + 1
-            its1_end = locus_58s.start - 1
-            its1_length = its1_end - its1_start + 1 if its1_end >= its1_start else 0
+            #JAC debugging
+            if args.verbose:
+                print("got a cluster with good evals")
 
-            its2_start = locus_58s.end + 1
-            its2_end = locus_28s.start - 1
-            its2_length = its2_end - its2_start + 1 if its2_end >= its2_start else 0
+            if (strand == '-'):
+                #first locus is 28S, all are end-->start in GFF!
+                its1_start = second_locus.end + 1
+                its1_end = third_locus.start -1
+                its1_length = its1_end - its1_start + 1 if its1_end >= its1_start else 0
+
+                its2_start = first_locus.end + 1
+                its2_end = second_locus.start - 1
+                its2_length = its2_end - its2_start + 1 if its2_end >= its2_start else 0
+
+            else:
+                #first locus is 18S, all are start--> end in GFF
+                its1_start = first_locus.end + 1
+                its1_end = second_locus.start - 1
+                its1_length = its1_end - its1_start + 1 if its1_end >= its1_start else 0
+
+                its2_start = second_locus.end + 1
+                its2_end = third_locus.start - 1
+                its2_length = its2_end - its2_start + 1 if its2_end >= its2_start else 0
 
             if not (min_its1_length <= its1_length <= max_its1_length):
                 continue
             if not (min_its2_length <= its2_length <= max_its2_length):
                 continue
 
-            if not (locus_18s.strand == locus_58s.strand == locus_28s.strand):
-                continue
+            if (strand == '-'):
+                locus_18s = third_locus
+                locus_28s = first_locus
+            else:
+                locus_18s = first_locus
+                locus_28s = third_locus
+            locus_58s = second_locus
 
             cluster = {
                 'seqid': seqid,
                 'strand': strand,
-                'start': locus_18s.start,
-                'end': locus_28s.end,
+                'start': first_locus.start,
+                'end': third_locus.end,
                 '18S': locus_18s,
                 '5.8S': locus_58s,
                 '28S': locus_28s,
                 'ITS1_length': its1_length,
                 'ITS2_length': its2_length,
-                'total_length': locus_28s.end - locus_18s.start + 1,
+                'total_length': third_locus.end - first_locus.start + 1,
                 'max_evalue': max(e_values),
                 'mean_evalue': sum(e_values) / len(e_values)
             }
@@ -357,6 +419,13 @@ def write_outputs(clusters: List[Dict], species_name: str, output_dir: str):
 
     print(f"  ✓ Results: {tsv_file} ({len(clusters)} clusters)")
 
+    # write 6-column BED file for entire clusters, so BEDtools getfasta can extract them nicely for us
+    # because of the reverse-complement in getfasta, they will all be oriented 18S->5.8S->28S after this
+    bed_file = f"{base_name}_clusters.bed"
+    with open(bed_file, 'w') as f:
+        for i, cluster in enumerate(clusters, 1):
+            f.write(f"{cluster['seqid']}\t{cluster['start']}\t{cluster['end']}\tcluster_{i}\t0\t{cluster['strand']}\n")
+
 
 def process_single_species(fasta_file: str, gff_dir: str, results_dir: str):
     """Process one genomic FASTA: pybarrnap → GFF3 → parse → clusters."""
@@ -367,7 +436,7 @@ def process_single_species(fasta_file: str, gff_dir: str, results_dir: str):
     # Step 1: Run pybarrnap if GFF doesn't exist
     gff_file = os.path.join(gff_dir, f"{species_name}_barrnap.gff3")
 
-    if not os.path.exists(gff_file) or os.path.getsize(gff_file) == 0:
+    if not os.path.exists(gff_file) or os.path.getsize(gff_file) == 0 or args.overwrite_GFF:
         print(f"\n{'=' * 60}")
         print(f"Step 1: pybarrnap annotation for {species_name}")
         print(f"{'=' * 60}")
@@ -436,7 +505,7 @@ def main():
         print(f"  - {os.path.basename(f)}")
 
     # temporrary for testig - just run on first two file!
-    fasta_files = fasta_files[21:22]
+    #fasta_files = fasta_files[21:22]
     # Process all filesl
     all_results = {}
     for fasta_file in sorted(fasta_files):
@@ -463,8 +532,9 @@ def main():
     print(f"{'=' * 60}")
 
     # List result files
+    #JAC 3/6 added BED
     if os.path.exists(RESULTS_DIR):
-        result_files = [f for f in os.listdir(RESULTS_DIR) if f.endswith(('.tsv', '.txt'))]
+        result_files = [f for f in os.listdir(RESULTS_DIR) if f.endswith(('.tsv', '.txt', '.bed'))]
         print(f"\nResult files ({len(result_files)} total):")
         for f in sorted(result_files):
             fpath = os.path.join(RESULTS_DIR, f)

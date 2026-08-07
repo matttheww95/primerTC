@@ -1,1 +1,311 @@
-test
+---
+title: "primerTC test"
+author: "Matthew Latham"
+output: html_document
+---
+
+Set up
+```{r}
+library(Biostrings)
+library(pwalign)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(ggtree)
+library(stringr)
+library(readxl)
+library(writexl)
+library(ape)
+
+# heatmap colours
+color_primers <- c(
+  "Primer PID < 70%" = "#CFECFF",
+  "Primer 70-75%"    = "#B2CCF1",
+  "Primer 75-80%"    = "#96ADE3",
+  "Primer 80-85%"    = "#798DD5",
+  "Primer 85-90%"    = "#5C6DC7",
+  "Primer 90-95%"    = "#404EB9",
+  "Primer 95-100%"   = "#232EAB",
+  "Primer 100%"      = "#00FF74",
+  "No primer match"  = "grey70"
+)
+
+# cutadapt binary
+cutadapt <- "/opt/homebrew/bin/cutadapt"
+
+# in/out directories
+out_path   <- "/Users/matthew/Desktop/JA-TEST"
+image_path <- "/Users/matthew/Desktop/JA-TEST/images_test"
+
+# fasta database used for the cutadapt search AND for the tree/heatmap rows;
+# this must be the same FASTA the tree was built from
+sequence_path <- "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus-JA_TEST.fasta.fasta"
+
+# species to print to the console as a sanity check after each primer
+species_of_interest <- c(
+  "Strongyloides_ratti",
+  "Trichuris_muris",
+  "Ascaris_suum",
+  "Brugia_pahangi",
+  "Heligmosomoides_polygyrus",
+  "Heligmosomoides_polygyrus_bakeri",
+  "Heligmosomoides_polygyrus_polygyrus"
+)
+
+# tree built from the aligned consensus sequences
+tree_path <- "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus_aligned.fasta.raxml.bestTree"
+
+# with "-b" cutadapt also reports very short partial hits at the ends of a
+# sequence (a handful of bases), which are noise rather than primer binding;
+# hits covering less than this fraction of the primer are treated as no match.
+# set to 0 to keep every hit cutadapt reports.
+min_match_fraction <- 0.5
+
+dir.create(image_path, showWarnings = FALSE, recursive = TRUE)
+
+# all primers, each with its own name -> its own cutadapt run and info file
+primers <- c(
+  "operon_fw"     = "CTTGTCTCAAAGATTAAGCCATGCAT",  # 18S-CL-F3
+  "operon_rv"     = "CAGCTACTAGATGGTTCGATTAGTC",   # 28S-CL-R
+  "internal_1_rc" = "AGCGATAGCTTAATTAATTTTACCATT", # Brug.ITS.f.260 RC
+  "internal_2"    = "TTAGTTTCTTTTCCTCCGCT",        # NC2
+  "internal_3"    = "TTTCACTCGCCGTTACTAAGGGAATC",  # V2R
+  "internal_4"    = "TTCCACCCAAACACTCG",           # LR16
+  "internal_5"    = "GGAAAYAATTDCAATTCCCKRTCC",    # Nem1619
+  "internal_6"    = "TCGGAAGGAACCAGCTACTA"         # D3B
+)
+```
+
+Helper functions
+```{r}
+# ambiguity-aware identity: a position counts as a match when the IUPAC codes of
+# the two bases share at least one nucleotide (so Y matches C and T, etc.)
+iupac_sets <- c(
+  as.list(setNames(strsplit(Biostrings::IUPAC_CODE_MAP, ""),
+                   names(Biostrings::IUPAC_CODE_MAP))),
+  list("-" = character(0), "+" = character(0), "." = character(0))
+)
+
+bases_compatible <- function(a, b) {
+  length(intersect(iupac_sets[[toupper(a)]], iupac_sets[[toupper(b)]])) > 0
+}
+
+count_iupac_matches <- function(seq_aln, primer_aln) {
+  a <- strsplit(toupper(seq_aln), "", fixed = TRUE)[[1]]
+  b <- strsplit(toupper(primer_aln), "", fixed = TRUE)[[1]]
+  n <- min(length(a), length(b))
+  if (n == 0) return(0L)
+  sum(vapply(seq_len(n), function(i) bases_compatible(a[i], b[i]), logical(1)))
+}
+
+# run cutadapt for one primer and return its cleaned info table
+run_cutadapt <- function(primer_name, primer_seq) {
+  trimmed_fasta <- file.path(out_path, paste0(primer_name, ".fasta"))
+  info_file     <- file.path(out_path, paste0(primer_name, ".tsv"))
+
+  status <- system2(
+    command = cutadapt,
+    args = c(paste0("-b primer=", primer_seq),
+             "-e 0.2",       # allow up to 20% errors in the primer match
+             "--revcomp",    # also search the reverse complement
+             paste0("--info-file=", info_file),
+             "-o", trimmed_fasta,
+             sequence_path)
+  )
+  if (status != 0) stop("cutadapt failed for ", primer_name)
+
+  # the info file has no header and a variable number of columns: rows with a
+  # primer match have 12 fields, rows without a match only have 3, so pad every
+  # line to 12 fields and name the columns positionally
+  info_columns <- c("Name", "Error", "Start", "End", "Left_Sequence",
+                    "Match_Sequence", "Right_Sequence", "Primer",
+                    "X9", "X10", "X11", "RevComp")
+
+  fields <- strsplit(readLines(info_file, warn = FALSE), "\t", fixed = TRUE)
+  fields <- lapply(fields, function(x) {
+    x[x == ""] <- NA_character_
+    length(x) <- length(info_columns)
+    x
+  })
+
+  as_tibble(do.call(rbind, fields), .name_repair = "minimal") %>%
+    setNames(info_columns) %>%
+    # cutadapt writes the read name up to the first space; drop the " rc" suffix
+    mutate(Name = str_remove(Name, " rc$")) %>%
+    # keep one row per sequence, preferring the row that actually has a match
+    mutate(HAS_MATCH = !is.na(Match_Sequence) &
+             coalesce(Error != "-1", FALSE) &
+             coalesce(Primer == "primer", FALSE)) %>%
+    arrange(Name, desc(HAS_MATCH)) %>%
+    distinct(Name, .keep_all = TRUE) %>%
+    mutate(Match_Sequence = if_else(HAS_MATCH, Match_Sequence, NA_character_))
+}
+```
+
+Per-primer coverage: cutadapt + pairwise alignment
+```{r}
+all_species_names <- unique(str_remove(names(readDNAStringSet(sequence_path)), " rc$"))
+Genus_Tree <- ape::read.tree(tree_path)
+
+# genus label used for the heatmap rows; must match the tree tip labels
+extract_genus <- function(x) str_extract(x, "[A-Z][a-z]+_[a-z]+$")
+
+# the tree may carry the full FASTA headers rather than the short genus_species
+# labels; shorten them so the heatmap rows can be matched to the tips
+if (!any(Genus_Tree$tip.label %in% extract_genus(all_species_names))) {
+  Genus_Tree$tip.label <- extract_genus(Genus_Tree$tip.label)
+}
+
+final_summary <- list()
+
+for (primer_name in names(primers)) {
+
+  primer_seq    <- primers[[primer_name]]
+  primer_length <- nchar(primer_seq)
+  last_bp       <- str_sub(primer_seq, -1)
+
+  message("Processing: ", primer_name)
+
+  cutadapt_info <- run_cutadapt(primer_name, primer_seq)
+
+  # only align the sequences cutadapt actually matched; the rest stay absent and
+  # end up as "No primer match" tiles
+  matched <- cutadapt_info %>%
+    filter(!is.na(Match_Sequence),
+           nchar(Match_Sequence) >= min_match_fraction * primer_length)
+
+  pwa <- pwalign::pairwiseAlignment(
+    pattern = matched$Match_Sequence,
+    subject = primer_seq,
+    type    = "global"
+  )
+
+  aligned_seq    <- as.character(pwalign::alignedPattern(pwa))
+  aligned_primer <- as.character(pwalign::alignedSubject(pwa))
+
+  pwa_summary <- tibble(
+    SEQ_NAME    = matched$Name,
+    PRIMER      = primer_name,
+    PRIMER_SEQ  = primer_seq,
+    ALIGN_SCORE = pwalign::score(pwa),
+    PERC_ID     = pwalign::pid(pwa),
+    ALIGNED_SEQ = aligned_seq,
+    MATCH_COUNT = mapply(count_iupac_matches, aligned_seq, aligned_primer,
+                         USE.NAMES = FALSE),
+    RAW_SEQ     = paste0(coalesce(matched$Left_Sequence, ""),
+                         matched$Match_Sequence,
+                         coalesce(matched$Right_Sequence, ""))
+  ) %>%
+    mutate(
+      PMP      = (MATCH_COUNT / primer_length) * 100,
+      LAST_1NT = if_else(
+        vapply(str_sub(ALIGNED_SEQ, -1), bases_compatible, logical(1),
+               b = last_bp, USE.NAMES = FALSE),
+        "YES", "NO"
+      )
+    )
+
+  # sanity check: the species of interest for this primer
+  print(
+    pwa_summary %>%
+      mutate(genus = extract_genus(SEQ_NAME)) %>%
+      filter(genus %in% species_of_interest) %>%
+      select(genus, ALIGNED_SEQ, MATCH_COUNT, PMP, LAST_1NT)
+  )
+
+  final_summary[[primer_name]] <- pwa_summary
+}
+
+final_summary <- bind_rows(final_summary) %>% arrange(SEQ_NAME, PRIMER)
+write_xlsx(final_summary, file.path(out_path, "final_summary_all_primers.xlsx"))
+```
+
+Per-genus means, one heatmap + tree per primer
+```{r}
+# every genus in the database, so genera with no primer match keep an NA tile
+all_genera <- tibble(genus = extract_genus(all_species_names)) %>%
+  filter(!is.na(genus)) %>%
+  distinct()
+
+for (primer_name in names(primers)) {
+
+  # mean % identity per genus for this primer
+  mean_flt <- final_summary %>%
+    filter(PRIMER == primer_name) %>%
+    mutate(genus = extract_genus(SEQ_NAME)) %>%
+    filter(!is.na(genus)) %>%
+    select(genus, PMP, LAST_1NT) %>%
+    distinct() %>%
+    group_by(genus) %>%
+    summarise(
+      PMP_AVE = mean(PMP, na.rm = TRUE),
+      # if a genus has both YES and NO, keep YES
+      LAST_1NT_Primer = if_else(any(LAST_1NT == "YES"), "YES", "NO"),
+      .groups = "drop"
+    )
+
+  # genera absent from the cutadapt results get PMP_AVE = NA
+  mean_flt <- all_genera %>% left_join(mean_flt, by = "genus")
+
+  write_xlsx(mean_flt, file.path(out_path, paste0(primer_name, "_Mean_flt.xlsx")))
+
+  final <- mean_flt %>%
+    mutate(
+      Primer = case_when(
+        is.na(PMP_AVE)                     ~ NA_character_,
+        PMP_AVE < 70                       ~ "Primer PID < 70%",
+        PMP_AVE >= 70  & PMP_AVE < 75      ~ "Primer 70-75%",
+        PMP_AVE >= 75  & PMP_AVE < 80      ~ "Primer 75-80%",
+        PMP_AVE >= 80  & PMP_AVE < 85      ~ "Primer 80-85%",
+        PMP_AVE >= 85  & PMP_AVE < 90      ~ "Primer 85-90%",
+        PMP_AVE >= 90  & PMP_AVE < 95      ~ "Primer 90-95%",
+        PMP_AVE >= 95  & PMP_AVE < 100     ~ "Primer 95-100%",
+        PMP_AVE == 100                     ~ "Primer 100%"
+      ),
+      # cutadapt only reports matches within its -e 0.2 error budget, so a genus
+      # with no reported match is "no primer match" rather than a low identity
+      Primer = coalesce(Primer, "No primer match"),
+      Primer = factor(Primer, levels = names(color_primers))
+    )
+
+  write_xlsx(final %>% mutate(Primer = as.character(Primer)),
+             file.path(out_path, paste0(primer_name, "_Final_Primer.xlsx")))
+
+  heatmap_Primer <- final %>%
+    select(id = genus, Primer) %>%
+    tibble::column_to_rownames(var = "id")
+
+  # black tip point where the primer matched but its last base does not
+  no_match_primer <- final %>%
+    transmute(
+      label = genus,
+      Last_bp = if_else(!is.na(PMP_AVE) & LAST_1NT_Primer == "NO",
+                        "Last bp no match", NA_character_)
+    )
+
+  Plot_Genus_Tree <- ggtree(Genus_Tree, layout = "circular", branch.length = "none") +
+    geom_tiplab(align = TRUE, linesize = 0.5, vjust = 0.5, hjust = -0.2, offset = 0)
+
+  Plot_Genus_Tree <- Plot_Genus_Tree %<+% no_match_primer +
+    geom_tippoint(aes(color = Last_bp), size = 4) +
+    scale_colour_manual(values = "black", na.value = NA, name = NULL,
+                        na.translate = FALSE)
+
+  final_tree <- gheatmap(
+    Plot_Genus_Tree,
+    heatmap_Primer,
+    offset   = 8,
+    color    = NULL,
+    colnames = FALSE,
+    width    = 0.2
+  ) +
+    scale_fill_manual(values = color_primers, drop = FALSE, na.value = "grey70") +
+    labs(fill = "Primers")
+
+  ggsave(file.path(image_path, paste0(primer_name, "_CORRECTED.png")), final_tree,
+         width = 40, height = 60, limitsize = FALSE)
+  ggsave(file.path(image_path, paste0(primer_name, "_CORRECTED.pdf")), final_tree,
+         width = 40, height = 60, limitsize = FALSE)
+}
+```

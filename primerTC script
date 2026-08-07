@@ -1,0 +1,377 @@
+---
+title: "primerTC"
+author: "Matthew Latham"
+date: "2026-05-15"
+output: html_document
+---
+
+set up
+```{r}
+# install/load packages
+library(Biostrings)
+library(dplyr)
+library(tidyr)
+library (tidyverse)
+library(ggplot2)
+library(ggtree)
+library(stringr)
+library(readxl)
+library(writexl)
+library(seqinr)
+library(ape)
+library(UpSetR)
+
+# colour primers
+color_primers <- c(
+  "Primer PID < 70%" = "#CFECFF",
+  "Primer 70-75%" = "#B2CCF1",
+  "Primer 75-80%" = "#96ADE3",
+  "Primer 80-85%" = "#798DD5",
+  "Primer 85-90%" = "#5C6DC7",
+  "Primer 90-95%" = "#404EB9",
+  "Primer 95-100%" = "#232EAB",
+  "Primer 100%" = "#00FF74"
+)
+
+# cutadapt directory 
+cutadapt <- "/opt/homebrew/bin/cutadapt"
+  
+# in/out folder directories
+input_path <- "/Users/matthew/Desktop/JA-TEST"
+out_path <- "/Users/matthew/Desktop/JA-TEST"
+
+# fasta database directory
+sequence_path <- "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus-JA_TEST.fasta.fasta"
+
+# primer sequence/oligo length (bp) ----- NOTE: just one?
+primers <- c("PR_SEQ" = "TCGGAAGGAACCAGCTACTA") #D3B - internal-6
+length_primer <- getLength(primers)
+#("PR_SEQ" = "CTTGTCTCAAAGATTAAGCCATGCAT") #18S-CL-F3 - operon-fw
+#("PR_SEQ" = "CAGCTACTAGATGGTTCGATTAGTC") #28S-CL-R - operon-rv
+#("PR_SEQ" = "AGCGATAGCTTAATTAATTTTACCATT") #Brug.ITS.f.260 - internal-1-RC
+#("PR_SEQ" = "TTAGTTTCTTTTCCTCCGCT") #NC2 - internal-2
+#("PR_SEQ" = "TTTCACTCGCCGTTACTAAGGGAATC") #V2R - internal-3
+#("PR_SEQ" = "TTCCACCCAAACACTCG") #LR16 - internal-4
+#("PR_SEQ" = "GGAAAYAATTDCAATTCCCKRTCC") #Nem1619 - internal-5
+#("PR_SEQ" = "TCGGAAGGAACCAGCTACTA") #D3B - internal-6
+#("PR_SEQ" = "GTAGGTGAACCTGCGGAAGAATCATT") #NC5
+#("PR_SEQ" = "AAATGGTAAAATTAATTAAGCTATCGCT") #Brug.ITS.f.260 - internal-1
+#("PR_SEQ" = "AGCGGAGGAAAAGAAACTAA") #NC2 - internal-2-RC
+#("PR_SEQ" = "GATTCCCTTAGTAACGGCGAGTGAAA") #V2R - internal-3-RC
+#("PR_SEQ" = "CGAGTGTTTGGGTGGAA") #LR16 - internal-4-RC
+#("PR_SEQ" = "GGAYMGGGAATTGHAATTRTTTCC") #Nem1619 - internal-5-RC
+#("PR_SEQ" = "TAGTAGCTGGTTCCTTCCGA") #D3B - internal-6-RC
+#("PR_SEQ" = "GACTAATCGAACCATCTAGTAGCTG") #28S-CL-R-RC - operon-rv-RC
+
+
+# summary
+final_summary <- list()
+```
+
+evaluating phylogenetic coverage
+```{r}
+# cutadapt
+for (primer in (names(primers))) {
+  
+  primer_name = primer
+  primer_seq <- primers[primer_name]
+  
+  # filepaths
+  input <- file.path(input_path)
+  output <- file.path(out_path, paste0(primer_name, ".fasta")) #creating an output file for the result of the primer removal step. This will also automatically create a sub-folder for each of the barcode.
+  info_file <- file.path(out_path, paste0(primer_name, ".tsv"))
+  info_file2 <- file.path(out_path, paste0(primer_name, "_2.tsv"))
+  
+  
+  # cutadapt
+  system2(
+    command = cutadapt,
+    args = c(paste0("-b primer=", primer_seq, collapse = ""), #tell that the primer can be anywhere in the sequence
+             "-e 0.2", #80% identity minimum
+             "--revcomp", #looks also at the rev complement 
+             paste0("--info-file=", info_file), #detail output
+             "-o", output, #output
+             sequence_path) #input
+  )
+  
+  system2(
+    command = "echo",
+    args = c(
+      "'Name\tError\tStart\tEnd\tLeft_Sequence\tMatch_Sequence\tRight_Sequence\tPrimer\t-\t-\t-\tRevComp'",
+      "| cat -", info_file,
+      ">",
+      info_file2
+    )
+  )
+  
+  # clean-up cutadapt
+  cutadapt_info <- read_tsv(info_file2) %>%
+    select(Name, Primer, Error, Start, End,Left_Sequence, Match_Sequence, Right_Sequence, RevComp) %>%   #import file into dataframe and only keep the relevant column
+    mutate(RAW_SEQ = paste0(Left_Sequence, Match_Sequence, Right_Sequence)) %>%
+    mutate(RAW_SEQ = case_when(
+      RAW_SEQ == "NANANA" ~ as.character(Start), TRUE ~ RAW_SEQ
+    )
+    )
+  
+  cutadapt_info$Match_Sequence[is.na(cutadapt_info$Match_Sequence)] <- "-"
+  
+  # pairwise alignment 
+  pwa <- pwalign::pairwiseAlignment( 
+    pattern = (cutadapt_info$Match_Sequence), 
+    subject = primer_seq,  
+    type    = "global"
+  )
+  
+  # PWA summary
+  pwa_summary <-
+    tibble(
+      SEQ_NAME         = cutadapt_info$Name,
+      PRIMER           = primer_name,
+      ALIGN_TYPE       = pwalign::type(pwa),      # alignment type
+      ALIGN_SCORE      = pwalign::score(pwa),     # alignment score
+      PERC_ID          = pwalign::pid(pwa),       # percent identity
+      SEQ_LENGTH       = pwalign::nchar(pwa),     # ASV sequence length
+      MATCH_COUNT      = pwalign::nmatch(pwa),    # total number of bases that matches reference sequence
+      DIFF_COUNT       = pwalign::nedit(pwa),     # total number of bases that differs from reference sequence
+      SUB_COUNT        = pwalign::nmismatch(pwa), # total number (bases) of substitution
+      INS_COUNT        = pwalign::nindel(pwa)@insertion[, "Length"],   # total number of insertion fragment
+      DEL_COUNT        = pwalign::nindel(pwa)@deletion[, "Length"],    # total number of deletion fragment
+      INS_LENGTH_TOTAL = pwalign::nindel(pwa)@insertion[, "WidthSum"], # total length of insertion
+      DEL_LENGTH_TOTAL = pwalign::nindel(pwa)@deletion[, "WidthSum"],  # total length of deletion
+      ALIGNED_SEQ  = pwalign::aligned(pwa) %>% as.character(),      # aligned ASV sequence, insertion not shown
+      RAW_SEQ = cutadapt_info$RAW_SEQ
+    )
+  final_summary[[primer_name]] <- pwa_summary
+  
+}
+
+# final summary
+final_summary <- bind_rows(final_summary) %>%
+  arrange(SEQ_NAME, PRIMER)
+
+write_xlsx(final_summary, "/Users/matthew/Desktop/JA-TEST/final_summary.xlsx")
+
+# last primer match and identity
+final_summary_flt <- final_summary %>%
+  ## create new col, first checks which primer, and if last nt matches, "YES", else "NO"
+  mutate(
+    LAST_1NT = case_when(
+      (PRIMER == "PR_SEQ") & (str_detect(ALIGNED_SEQ, "A$")) ~ "YES", # change last bp of primer
+      TRUE ~ "NO"
+    ),
+    ## create new col, calculate matching % identity of the primers
+    PMP = ((MATCH_COUNT/length_primer)*100) 
+  )
+
+write_xlsx(final_summary_flt, "/Users/matthew/Desktop/JA-TEST/final_summary_flt.xlsx") 
+
+### extracting genus
+# Summary <- final_summary_flt %>% mutate(genus = str_extract(SEQ_NAME, "[^;]*;[^;]*$") %>% str_extract("^[^;]+"))
+# I HAVE CHANGED TO BELOW
+Summary <- final_summary_flt %>%
+  mutate(genus = str_extract(SEQ_NAME, "[A-Z][a-z]+_[a-z]+$"))
+
+match <- Summary %>% 
+  select("genus","PRIMER", "PMP", "LAST_1NT") %>%
+  distinct()
+
+# mean % ID per genus
+mean <- match %>% 
+  group_by(PRIMER, genus, LAST_1NT)  %>% 
+  summarize(PMP_AVE = mean(PMP, na.rm = TRUE)) %>% 
+  pivot_wider(names_from = PRIMER, values_from = PMP_AVE)
+
+# filter % threshold/ indicate genue <70% identity 
+mean_flt <- mean %>%
+  select(genus, LAST_1NT, PR_SEQ) %>%
+  mutate(
+    PR_SEQ = case_when(
+      (PR_SEQ < 70 ) ~ "PID < 70%",
+      TRUE ~ as.character(PR_SEQ))
+  )
+
+write_xlsx(mean_flt, "/Users/matthew/Desktop/JA-TEST/Mean.xlsx") # USER DEPENDENT - Change to your output path of choice
+
+# rename LAST_1NT columns
+names(mean_flt)[names(mean_flt) == 'LAST_1NT'] <- "LAST_1NT_Primer"
+
+# if a genus has both YES and NO, retain the YES choice for last NT
+mean_flt <- mean_flt %>%
+  group_by(genus) %>%
+  arrange(desc(LAST_1NT_Primer), .by_group = TRUE) %>% # arranges for each genus group to have the row with YES in LAST_1NT_ at the top
+  dplyr::slice(1) # keep the first row (ie YES row) for each group
+
+write_xlsx(mean_flt, "/Users/matthew/Desktop/JA-TEST/Mean_flt.xlsx")
+
+# creating final format
+final <- mean_flt %>%
+  mutate(
+    Primer = case_when(
+      (PR_SEQ > 70 & PR_SEQ <= 75) ~ "Primer 70-75%",
+      (PR_SEQ > 75 & PR_SEQ <= 80) ~ "Primer 75-80%",
+      (PR_SEQ > 80 & PR_SEQ <= 85) ~ "Primer 80-85%",
+      (PR_SEQ > 85 & PR_SEQ <= 90) ~ "Primer 85-90%",
+      (PR_SEQ > 90 & PR_SEQ <= 95) ~ "Primer 90-95%",
+      (PR_SEQ > 95 & PR_SEQ <= 99.99) ~ "Primer 95-100%",
+      (PR_SEQ == 100) ~ "Primer 100%",
+      (PR_SEQ == "PID < 70%") ~ "Primer PID < 70%"
+    )
+  )
+
+write_xlsx(final, "/Users/matthew/Desktop/JA-TEST/Final_Primer.xlsx")
+
+
+
+
+
+##### adding below to remove the single NA value
+final <- final %>%
+  filter(!is.na(genus))
+
+
+
+
+
+## heatmap
+heatmap_Primer <-
+  final %>%
+  dplyr::rename(id = genus) %>%
+  select(id, Primer) %>%
+  column_to_rownames(var = "id")
+
+# create dataframe for the genus where the last bp of the primer does not match 
+no_match_primer <- read_excel("/Users/matthew/Desktop/JA-TEST/Mean_flt.xlsx") # path to the previously created Mean_flt.xlsx file for the specific primer
+
+no_match_primer <- no_match_primer %>% 
+  mutate(
+    Primer = case_when(
+      (PR_SEQ != "PID < 70%" & LAST_1NT_Primer == "NO") ~ "Last bp no match")
+  )
+```
+
+building phylogenetic tree for primerTC visualization
+```{r}
+# install.packages("BiocManager")
+# BiocManager::install(version = "3.19")
+# install Biostrings and DECIPHER
+# BiocManager::install("Biostrings")
+# BiocManager::install("DECIPHER")
+
+# generate consensus sequence for each genus in R
+library("DECIPHER")
+library("Biostrings")
+
+# file path to the downloaded ref seqs
+db_path <- "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus-JA_TEST.fasta.fasta"
+
+# file path to where you want to save the consensus sequence FASTA file
+consensus_path <- "/Users/matthew/Desktop/JA-TEST/all_fasta_consensus.fasta"
+
+# read in the ref seq database
+db <- Biostrings::readDNAStringSet(db_path)
+
+# extract genus names from the sequence names of the database
+db_seq_names <- names(db)
+# db_seq_genera <- vapply(strsplit(db_seq_names, ";"), `[`, 7, FUN.VALUE=character(1))
+### below added my me
+db_seq_genera <- sub(".*\\)_", "", db_seq_names)
+
+
+
+
+
+# group each ref seq by its genus
+db_seqs <- split(db, f = db_seq_genera)
+
+# loop through each genus and create multiple sequence alignment (MSA)
+# of all ref seqs within a genus and generate the consensus from the MSA
+for (i in seq_along(db_seqs)) {
+  genus_seqs <- db_seqs[[i]]
+  genus_name <- names(db_seqs)[i]
+
+  if (length(genus_seqs) > 1) {
+    genus_msa <- DECIPHER::AlignSeqs(DECIPHER::RemoveGaps(genus_seqs))
+    genus_consensus <-
+      Biostrings::DNAMultipleAlignment(genus_msa) |>
+      Biostrings::consensusString(ambiguityMap = Biostrings::IUPAC_CODE_MAP) |>
+      Biostrings::DNAStringSet()
+  } else {
+    genus_consensus <- genus_seqs
+  }
+
+  names(genus_consensus) <- genus_name
+
+  if (i == 1L) {
+    consensus <- genus_consensus
+  } else {
+    consensus <-c(consensus, genus_consensus)
+  }
+}
+
+Biostrings::writeXStringSet(consensus, consensus_path)
+```
+
+Generate alignment and tree from consensus sequences using MAFFT and RAxML-NG
+##### NOTE: below done in the Terminal
+
+# MAFFT aligner will be used for creating multiple sequence alignment (MSA) of the consensus sequences and RAxML-NG for building the tree. The easiest way to install both programs is to use conda by installing Miniconda. Instructions on how to install Miniconda is available here.
+# once Miniconda is installed, run the below command in a terminal program to install MAFFT and RAxML-NG in a conda environment called primertc-tree:
+
+
+
+conda create --name primertc-tree \
+  --channel bioconda --channel conda-forge \
+  mafft raxml-ng
+
+
+# once the programs are installed, run the below commands to perform multiple sequence alignment of the consensus sequences and generate a maximum likelihood tree using MAFFT and RAxML-NG. This process may take a few minutes up to a few hours or days depending on the number, length, and complexity of the sequences.
+
+# activate the conda environment containing MAFFT and RAxML-NG:
+conda activate primertc-tree
+
+# change working directory
+cd /Users/matthew/Desktop/JA-TEST
+
+# build alignment of consensus sequences:
+mafft --thread 4 all_fasta_consensus-JA_TEST.fasta.fasta \
+    > all_fasta_consensus_aligned.fasta
+
+# build tree from aligned consensus sequences using GTR+G model (will take a while)
+raxml-ng --threads 2 --model GTR+G \
+  --msa all_fasta_consensus_aligned.fasta
+
+
+
+importing the phylogenetic tree
+```{r}
+Genus_Tree <- read.tree("/Users/matthew/Desktop/JA-TEST/all_fasta_consensus_aligned.fasta.raxml.bestTree") # use  tree called "RAxML_bestTree".
+
+Plot_Genus_Tree <- ggtree(Genus_Tree, layout = "circular", branch.length = "none") + 
+  geom_tiplab(align=TRUE, linesize=0.5, vjust = 0.5, hjust = -0.2, offset=0)
+
+# add dot where last_bp does not match. NOTE: Doing this means following tree (following chunk) fails
+Plot_Genus_Tree <- Plot_Genus_Tree %<+% no_match_primer +
+   geom_tippoint(aes(color = Primer), size=4) + #label last_bp does not match
+   scale_colour_manual(values= "black", na.value=NA) 
+```
+
+combining the phylogenetic coverage heatmap and RAxML tree 
+```{r}
+final_tree <- gheatmap(Plot_Genus_Tree, 
+                  heatmap_Primer, 
+                   offset = 8, 
+                   color=NULL,
+                   colnames = FALSE,
+                   width = 0.2) + 
+              scale_fill_manual(values=color_primers,
+                    labels = c("NA" = "No available reference sequence")) +
+              labs(fill = "Primers")
+
+ggsave(
+  "/Users/matthew/Desktop/JA-TEST/images/D3B_USETHISONE.png",
+  final_tree,
+  width = 40,
+  height = 60,
+  limitsize = FALSE
+)
+```
